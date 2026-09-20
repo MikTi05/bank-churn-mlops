@@ -1,0 +1,17 @@
+.venv/
+.git/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+_seminar_reference/
+screenshots/
+notebooks/
+tests/
+.env
+REPORT.md
+Churn_Modelling.csv
+.DS_Store
+build/
+dist/
+
