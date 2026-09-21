@@ -1,5 +1,7 @@
 """HTTP API for serving the trained Bank Churn pipeline."""
 
+import json
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -8,12 +10,102 @@ from typing import Literal
 import joblib
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
 from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import PlainTextResponse
+from starlette.types import Receive, Scope, Send
 
 from bank_churn_mlops import db
 from bank_churn_mlops.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def request_log_features(body: bytes) -> dict:
+    """Keep JSON inputs, falling back to text safe for PostgreSQL jsonb."""
+    try:
+        payload = json.loads(body)
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        encoded.encode("utf-8")
+        if "\\u0000" in encoded:
+            raise ValueError("PostgreSQL jsonb cannot store NUL characters")
+    except (ValueError, RecursionError):
+        return {"raw_body": body.decode("utf-8", errors="replace").replace("\x00", "\\u0000")}
+    return payload if isinstance(payload, dict) else {"body": payload}
+
+
+def request_latency_ms(request: Request) -> float:
+    """Route entry to prediction/error creation; excludes sending and DB work."""
+    return round((time.perf_counter() - request.state.started_at) * 1_000, 2)
+
+
+class PredictionRoute(APIRoute):
+    """Journal this route once, including failures before endpoint execution."""
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Move the usual method check inside the timed handler to also log 405.
+        await self.app(scope, receive, send)
+
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def logged_handler(request: Request):
+            request.state.started_at = time.perf_counter()
+            request.state.request_id = str(uuid.uuid4())
+            body = b""
+            latency_ms = None
+            try:
+                try:
+                    body = await request.body()
+                    if self.methods and request.method not in self.methods:
+                        raise StarletteHTTPException(
+                            status_code=405, headers={"Allow": ", ".join(sorted(self.methods))}
+                        )
+                    response = await original_handler(request)
+                except RequestValidationError as exc:
+                    latency_ms = request_latency_ms(request)
+                    response = await request_validation_exception_handler(request, exc)
+                except StarletteHTTPException as exc:
+                    latency_ms = request_latency_ms(request)
+                    response = await http_exception_handler(request, exc)
+            except Exception:
+                latency_ms = request_latency_ms(request)
+                logger.exception("Prediction request %s failed", request.state.request_id)
+                response = PlainTextResponse("Internal Server Error", status_code=500)
+
+            prediction = getattr(request.state, "prediction", None)
+            score = None
+            if response.status_code < 400 and prediction is not None:
+                score = prediction.score
+                latency_ms = prediction.latency_ms
+            elif latency_ms is None:
+                latency_ms = request_latency_ms(request)
+
+            payload = getattr(request.state, "features", None)
+            if payload is None:
+                payload = request_log_features(body)
+            background_tasks = BackgroundTasks()
+            background_tasks.add_task(
+                db.save_prediction,
+                request.state.request_id,
+                payload,
+                score,
+                getattr(request.app.state, "version", "unknown"),
+                latency_ms,
+                response.status_code,
+            )
+            if response.background is not None:
+                background_tasks.add_task(response.background)
+            response.background = background_tasks
+            return response
+
+        return logged_handler
 
 
 class Features(BaseModel):
@@ -53,30 +145,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="bank-churn-service", version="1.0", lifespan=lifespan)
 
 
-@app.exception_handler(RequestValidationError)
-async def log_validation_error(request: Request, exc: RequestValidationError):
-    response = await request_validation_exception_handler(request, exc)
-    if request.url.path == "/v1/predict":
-        try:
-            payload = await request.json()
-        except ValueError:
-            body = await request.body()
-            payload = {"raw_body": body.decode("utf-8", errors="replace")}
-
-        background_tasks = BackgroundTasks()
-        background_tasks.add_task(
-            db.save_prediction,
-            str(uuid.uuid4()),
-            payload,
-            None,
-            getattr(app.state, "version", "unknown"),
-            None,
-            422,
-        )
-        response.background = background_tasks
-    return response
-
-
 @app.get("/health")
 def health():
     return {
@@ -92,31 +160,24 @@ def ready():
     return {"status": "ready"}
 
 
-@app.post("/v1/predict")
-def predict(features: Features, background_tasks: BackgroundTasks) -> Prediction:
-    started_at = time.perf_counter()
-    request_id = str(uuid.uuid4())
+def predict(features: Features, request: Request) -> Prediction:
     payload = features.model_dump()
+    request.state.features = payload
     frame = pd.DataFrame([payload]).reindex(columns=app.state.meta["features"])
 
     score = float(app.state.pipeline.predict_proba(frame)[0, 1])
     churn = score >= app.state.meta["threshold"]
-    latency_ms = round((time.perf_counter() - started_at) * 1_000, 2)
-
-    background_tasks.add_task(
-        db.save_prediction,
-        request_id,
-        payload,
-        score,
-        app.state.version,
-        latency_ms,
-        200,
-    )
-
-    return Prediction(
+    prediction = Prediction(
         score=score,
         churn=churn,
         model_version=app.state.version,
-        request_id=request_id,
-        latency_ms=latency_ms,
+        request_id=request.state.request_id,
+        latency_ms=request_latency_ms(request),
     )
+    request.state.prediction = prediction
+    return prediction
+
+
+app.router.add_api_route(
+    "/v1/predict", predict, methods=["POST"], route_class_override=PredictionRoute
+)
