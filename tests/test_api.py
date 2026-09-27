@@ -1,8 +1,15 @@
+from bank_churn_mlops.config import settings
+
+
 def test_health_returns_200(client):
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "model_version": "1.0.0"}
+    assert response.json() == {
+        "status": "ok",
+        "model_version": "1.0.0",
+        "model_path": settings.model_path,
+    }
 
 
 def test_ready_returns_200_when_model_is_loaded(client):
