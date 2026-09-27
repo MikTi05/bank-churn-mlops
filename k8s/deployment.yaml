@@ -20,6 +20,7 @@ spec:
             - containerPort: 8000
           envFrom:
             - configMapRef: {name: bank-churn-config}
+            - secretRef: {name: bank-churn-secrets}
           startupProbe:
             httpGet:
               path: /health
